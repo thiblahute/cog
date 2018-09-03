@@ -133,9 +133,9 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cogcore.pc
     COMPONENT "development"
 )
 
-# libcogplaform-fdo
-
 if (COG_PLATFORM_FDO AND NOT COG_USE_WEBKITGTK)
+
+# libcogplaform-fdo
 
 set(COGPLATFORM_FDO_SOURCES
     platform/cog-platform-fdo.c
@@ -176,6 +176,19 @@ target_compile_options(cogplatform-fdo PUBLIC ${COGPLATFORM_FDO_CFLAGS})
 target_link_libraries(cogplatform-fdo cogcore ${COGPLATFORM_FDO_LDFLAGS})
 
 install(TARGETS cogplatform-fdo
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    COMPONENT "runtime"
+)
+
+# libcogplatform-default
+
+pkg_check_modules(COGPLATFORM_DEFAULT_DEPS REQUIRED wpe-0.2)
+add_library(cogplatform-default MODULE platform/cog-platform-default.c)
+target_include_directories(cogplatform-default PUBLIC ${COGPLATFORM_DEFAULT_DEPS_INCLUDE_DIRS})
+target_compile_options(cogplatform-default PUBLIC ${COGPLATFORM_DEFAULT_DEPS_CFLAGS})
+target_link_libraries(cogplatform-default PUBLIC cogcore ${COGPLATFORM_DEFAULT_DEPS_LDFLAGS})
+
+install(TARGETS cogplatform-default
     DESTINATION ${CMAKE_INSTALL_LIBDIR}
     COMPONENT "runtime"
 )
