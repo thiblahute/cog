@@ -89,6 +89,10 @@ static struct {
     struct egl_display *display;
     EGLContext context;
     EGLConfig egl_config;
+
+    PFNEGLCREATEWAYLANDBUFFERFROMIMAGEWL createWaylandBufferFromImageWL;
+    PFNEGLCREATEIMAGEKHRPROC createImageKHR;
+    PFNEGLDESTROYIMAGEKHRPROC destroyImageKHR;
 } egl_data;
 
 static struct {
@@ -136,10 +140,44 @@ static struct {
 
 static struct {
     struct wpe_view_backend *backend;
-    EGLImageKHR image;
-    struct wl_buffer *buffer;
     struct wl_callback *frame_callback;
+
+    GList* committed_buffers;
 } wpe_view_data = {NULL, };
+
+struct cog_committed_buffer {
+    struct wl_resource* resource;
+    EGLImageKHR image;
+    struct wl_buffer* buffer;
+    bool active;
+};
+
+static gint
+find_committed_buffer (gconstpointer a, gconstpointer b)
+{
+    const struct cog_committed_buffer* committed_buffer = a;
+    const struct wl_resource* buffer_resource = b;
+
+    if (buffer_resource == committed_buffer->resource)
+        return 0;
+    return 1;
+}
+
+static void
+free_committed_buffer (gpointer data)
+{
+    struct cog_committed_buffer* committed_buffer = data;
+    g_clear_pointer(&committed_buffer->buffer, wl_buffer_destroy);
+
+    if (committed_buffer->image)
+        egl_data.destroyImageKHR (egl_data.display, committed_buffer->image);
+
+    if (committed_buffer->resource)
+        wpe_view_backend_exportable_fdo_dispatch_release_buffer (wpe_host_data.exportable,
+                                                                 committed_buffer->resource);
+
+    g_free (committed_buffer);
+}
 
 
 struct wl_event_source {
@@ -1022,10 +1060,11 @@ request_frame (void)
 static void
 on_buffer_release (void* data, struct wl_buffer* buffer)
 {
-    EGLImageKHR image = data;
-    wpe_view_backend_exportable_fdo_egl_dispatch_release_image (wpe_host_data.exportable,
-                                                                image);
-    g_clear_pointer (&buffer, wl_buffer_destroy);
+    struct cog_committed_buffer* committed_buffer = data;
+    committed_buffer->active = false;
+
+    wpe_view_backend_exportable_fdo_dispatch_release_buffer (wpe_host_data.exportable,
+                                                             committed_buffer->resource);
 }
 
 static const struct wl_buffer_listener buffer_listener = {
@@ -1033,31 +1072,59 @@ static const struct wl_buffer_listener buffer_listener = {
 };
 
 static void
-on_export_egl_image(void *data, EGLImageKHR image)
+on_export_buffer_resource (void* data, struct wl_resource* buffer_resource)
 {
-    wpe_view_data.image = image;
+    GList* entry = g_list_find_custom (wpe_view_data.committed_buffers,
+        buffer_resource, find_committed_buffer);
 
-    static PFNEGLCREATEWAYLANDBUFFERFROMIMAGEWL
-        eglCreateWaylandBufferFromImageWL;
-    if (eglCreateWaylandBufferFromImageWL == NULL) {
-        eglCreateWaylandBufferFromImageWL = (PFNEGLCREATEWAYLANDBUFFERFROMIMAGEWL)
-            eglGetProcAddress ("eglCreateWaylandBufferFromImageWL");
-        g_assert_nonnull (eglCreateWaylandBufferFromImageWL);
+    struct wl_buffer* buffer = NULL;
+    if (entry == NULL) {
+        struct cog_committed_buffer* committed_buffer = g_new0 (struct cog_committed_buffer, 1);
+        committed_buffer->resource = buffer_resource;
+
+        committed_buffer->image = egl_data.createImageKHR (egl_data.display, EGL_NO_CONTEXT,
+                                                 EGL_WAYLAND_BUFFER_WL, buffer_resource,
+                                                 NULL);
+
+        committed_buffer->buffer =
+            egl_data.createWaylandBufferFromImageWL (egl_data.display,
+                                               committed_buffer->image);
+        wl_buffer_add_listener (committed_buffer->buffer, &buffer_listener,
+                                committed_buffer);
+
+        committed_buffer->active = true;
+        wpe_view_data.committed_buffers = g_list_append (wpe_view_data.committed_buffers,
+            committed_buffer);
+
+        buffer = committed_buffer->buffer;
+    } else {
+        struct cog_committed_buffer* committed_buffer = entry->data;
+        committed_buffer->active = true;
+        buffer = committed_buffer->buffer;
     }
 
-    wpe_view_data.buffer = eglCreateWaylandBufferFromImageWL (egl_data.display,
-                                                              wpe_view_data.image);
-    g_assert_nonnull (wpe_view_data.buffer);
-    wl_buffer_add_listener(wpe_view_data.buffer, &buffer_listener, image);
+    g_assert_nonnull (buffer);
 
-    wl_surface_attach (win_data.wl_surface, wpe_view_data.buffer, 0, 0);
-    wl_surface_damage (win_data.wl_surface,
-                       0, 0,
+    wl_surface_attach (win_data.wl_surface, buffer, 0, 0);
+    wl_surface_damage (win_data.wl_surface, 0, 0,
                        win_data.width, win_data.height);
-
     request_frame ();
-
     wl_surface_commit (win_data.wl_surface);
+
+    GList* list_entry = wpe_view_data.committed_buffers;
+    while (list_entry != NULL) {
+        GList* next = list_entry->next;
+
+        struct cog_committed_buffer* committed_buffer = list_entry->data;
+        if (!committed_buffer->active) {
+            free_committed_buffer (committed_buffer);
+            wpe_view_data.committed_buffers =
+                g_list_delete_link (wpe_view_data.committed_buffers,
+                                    list_entry);
+        }
+
+        list_entry = next;
+    }
 }
 
 static gboolean
@@ -1188,6 +1255,17 @@ init_egl (GError **error)
         clear_egl ();
         return FALSE;
     }
+
+    egl_data.createWaylandBufferFromImageWL = (PFNEGLCREATEWAYLANDBUFFERFROMIMAGEWL)
+        eglGetProcAddress ("eglCreateWaylandBufferFromImageWL");
+    g_assert_nonnull (egl_data.createWaylandBufferFromImageWL);
+    egl_data.createImageKHR = (PFNEGLCREATEIMAGEKHRPROC)
+        eglGetProcAddress ("eglCreateImageKHR");
+    g_assert_nonnull (egl_data.createImageKHR);
+    egl_data.destroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)
+        eglGetProcAddress ("eglDestroyImageKHR");
+    g_assert_nonnull (egl_data.destroyImageKHR);
+    g_assert_nonnull (egl_data.destroyImageKHR);
 
     return TRUE;
 }
@@ -1408,11 +1486,9 @@ cog_platform_teardown (CogPlatform *platform)
     /* free WPE view data */
     if (wpe_view_data.frame_callback != NULL)
         wl_callback_destroy (wpe_view_data.frame_callback);
-    if (wpe_view_data.image != NULL) {
-        wpe_view_backend_exportable_fdo_egl_dispatch_release_image (wpe_host_data.exportable,
-                                                                    wpe_view_data.image);
-    }
-    g_clear_pointer (&wpe_view_data.buffer, wl_buffer_destroy);
+
+    g_list_free_full (wpe_view_data.committed_buffers, free_committed_buffer);
+    wpe_view_data.committed_buffers = NULL;
 
     /* @FIXME: check why this segfaults
     wpe_view_backend_destroy (wpe_view_data.backend);
@@ -1434,15 +1510,15 @@ cog_platform_get_view_backend (CogPlatform   *platform,
                                WebKitWebView *related_view,
                                GError       **error)
 {
-    static struct wpe_view_backend_exportable_fdo_egl_client exportable_egl_client = {
-        .export_egl_image = on_export_egl_image,
+    static struct wpe_view_backend_exportable_fdo_client exportable_client = {
+        .export_buffer_resource = on_export_buffer_resource,
     };
 
     wpe_host_data.exportable =
-        wpe_view_backend_exportable_fdo_egl_create (&exportable_egl_client,
-                                                    NULL,
-                                                    DEFAULT_WIDTH,
-                                                    DEFAULT_HEIGHT);
+        wpe_view_backend_exportable_fdo_create (&exportable_client,
+                                                NULL,
+                                                DEFAULT_WIDTH,
+                                                DEFAULT_HEIGHT);
     g_assert_nonnull (wpe_host_data.exportable);
 
     /* init WPE view backend */
